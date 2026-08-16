@@ -1697,7 +1697,9 @@ globalThis.__makeServiceBinding = (script, entrypoint = null) => {
         ? r.body
         : Uint8Array.from(r.bodyBytes || []);
     return __wrapServiceResponse(
-      new Response(body, { status: r.status, headers: r.headers }),
+      new Response(body, {
+        status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+      }),
       req.url);
   },
   // Workerd's test-visible Fetcher.scheduled(): invoke the target's

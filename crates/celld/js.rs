@@ -3304,7 +3304,9 @@ fn op_svc_call_impl(
         let mut cancel_guard = cancel_guard;
         gated_channel_send(gate, &SVC_CALL_TX, request, "no service binding channel").await?;
         let result = match rx.await {
-            Ok(Ok(response)) => Ok(encode_http_response(response, false)),
+            // A service binding can return a WebSocket upgrade. Preserve the
+            // target so a router Worker can forward that upgrade to ingress.
+            Ok(Ok(response)) => Ok(encode_http_response(response, true)),
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("service dropped: {error}")),
         };
@@ -5704,4 +5706,34 @@ mod conformance_web_platform_tests {
 #[cfg(all(test, celld_internal_tests))]
 mod call_order_private {
     include!(env!("CELLD_CONFORMANCE_CALL_ORDER_TESTS"));
+}
+
+#[cfg(test)]
+mod service_binding_response_tests {
+    use super::*;
+
+    #[test]
+    fn websocket_target_is_encoded_when_requested() {
+        let encoded = encode_http_response(
+            HttpResponse {
+                status: 101,
+                body: Vec::new(),
+                stream: None,
+                headers: Vec::new(),
+                ws: Some(WsTarget {
+                    id: 7,
+                    scope: "backend".into(),
+                    peer_node: None,
+                    peer_addr: None,
+                    peer_epoch: None,
+                }),
+                write_position: None,
+            },
+            true,
+        );
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["wsTarget"]["id"], 7);
+        assert_eq!(value["wsTarget"]["scope"], "backend");
+    }
 }
