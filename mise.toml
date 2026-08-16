@@ -1,0 +1,30 @@
+[tools]
+rust = "stable"
+clang = "22.1.8"
+make = "4.4.1"
+gh = "latest"
+
+[env]
+CC = "clang"
+CXX = "clang++"
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "clang"
+
+[tasks.format]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.check]
+description = "Type-check the celld workspace"
+run = "cargo check --workspace"
+
+[tasks.test]
+description = "Run celld's public workspace test suite"
+run = "cargo test --workspace --profile lab --locked"
+
+[tasks.lint]
+description = "Run the same clippy gate used by celld's container build"
+run = "cargo clippy --workspace --profile lab --all-targets --locked -- -D warnings"
+
+[tasks.build]
+description = "Build celld's fast local-development binary"
+run = "cargo build -p celld --profile lab"
