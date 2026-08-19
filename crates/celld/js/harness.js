@@ -896,6 +896,7 @@ class DurableObjectStorage {
     if (!transactionRoot) {
       this._transactionSerial = 0;
       this._transactionTail = Promise.resolve();
+      this._transactionActiveDepth = 0;
       this._syncKvListGeneration = 0;
     }
     this._kv = new SyncKvStorage(this);
@@ -998,23 +999,40 @@ class DurableObjectStorage {
   _transactionStart() {
     const root = this._transactionRoot;
     const savepoint = "cells_tx_" + (++root._transactionSerial);
+    const nested = root._transactionActiveDepth > 0;
     __storage_transaction_control(
-      this._scope, "start", this._transactionDepth > 0, savepoint,
+      this._scope, "start", nested, savepoint,
     );
-    return savepoint;
+    root._transactionActiveDepth++;
+    return { savepoint, nested, active: true };
   }
-  _transactionCommit(savepoint) {
-    __storage_transaction_control(
-      this._scope, "commit", this._transactionDepth > 0, savepoint,
-    );
+  _transactionCommit(transaction) {
+    try {
+      __storage_transaction_control(
+        this._scope, "commit", transaction.nested,
+        transaction.savepoint,
+      );
+    } finally {
+      if (transaction.active) {
+        transaction.active = false;
+        this._transactionRoot._transactionActiveDepth--;
+      }
+    }
   }
-  _transactionRollback(savepoint, explicit = false) {
-    __storage_transaction_control(
-      this._scope,
-      explicit ? "rollback_explicit" : "rollback",
-      this._transactionDepth > 0,
-      savepoint,
-    );
+  _transactionRollback(transaction, explicit = false) {
+    try {
+      __storage_transaction_control(
+        this._scope,
+        explicit ? "rollback_explicit" : "rollback",
+        transaction.nested,
+        transaction.savepoint,
+      );
+    } finally {
+      if (transaction.active) {
+        transaction.active = false;
+        this._transactionRoot._transactionActiveDepth--;
+      }
+    }
   }
   _transactionView(transactionControl) {
     return new DurableObjectStorage(
@@ -1035,35 +1053,35 @@ class DurableObjectStorage {
     }
   }
   transactionSync(f) {
-    const savepoint = this._transactionStart();
+    const transaction = this._transactionStart();
     const control = {
       rolledBack: false,
-      rollback: () => this._transactionRollback(savepoint, true),
+      rollback: () => this._transactionRollback(transaction, true),
     };
     try {
       const value = f(this._transactionView(control));
-      if (!control.rolledBack) this._transactionCommit(savepoint);
+      if (!control.rolledBack) this._transactionCommit(transaction);
       return value;
     } catch (error) {
       if (!control.rolledBack) {
-        try { this._transactionRollback(savepoint); } catch {}
+        try { this._transactionRollback(transaction); } catch {}
       }
       throw error;
     }
   }
   async _runTransaction(f) {
-    const savepoint = this._transactionStart();
+    const transaction = this._transactionStart();
     const control = {
       rolledBack: false,
-      rollback: () => this._transactionRollback(savepoint, true),
+      rollback: () => this._transactionRollback(transaction, true),
     };
     try {
       const value = await f(this._transactionView(control));
-      if (!control.rolledBack) this._transactionCommit(savepoint);
+      if (!control.rolledBack) this._transactionCommit(transaction);
       return value;
     } catch (error) {
       if (!control.rolledBack) {
-        try { this._transactionRollback(savepoint); } catch {}
+        try { this._transactionRollback(transaction); } catch {}
       }
       throw error;
     }
