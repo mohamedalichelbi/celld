@@ -80,26 +80,46 @@ pub type WsPullReceiver = tokio::sync::mpsc::UnboundedReceiver<WsPull>;
 pub type WsPullSender = tokio::sync::mpsc::UnboundedSender<WsPull>;
 
 /// One socket's inbound queue. Shared so an op can await it without holding
-/// the registry lock; one isolate polls a given socket serially.
+/// the registry lock. The sender lets the HTTP server feed a Worker socket.
 type WsPullQueue = Arc<tokio::sync::Mutex<WsPullReceiver>>;
-type WsPullRegistry = std::sync::Mutex<HashMap<u64, WsPullQueue>>;
-
-/// Inbound queues for isolate-polled sockets, keyed by wsId.
-static WS_PULL: OnceLock<WsPullRegistry> = OnceLock::new();
-
-fn ws_pull() -> &'static WsPullRegistry {
-    WS_PULL.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct WsPullRegistry {
+    queues: HashMap<u64, WsPullQueue>,
+    senders: HashMap<u64, WsPullSender>,
 }
 
-pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
-    ws_pull()
-        .lock()
-        .unwrap()
+/// Inbound queues for isolate-polled sockets, keyed by wsId.
+static WS_PULL: OnceLock<std::sync::Mutex<WsPullRegistry>> = OnceLock::new();
+
+fn ws_pull() -> &'static std::sync::Mutex<WsPullRegistry> {
+    WS_PULL.get_or_init(|| std::sync::Mutex::new(WsPullRegistry::default()))
+}
+
+pub fn ws_pull_register(id: u64, tx: WsPullSender, rx: WsPullReceiver) {
+    let mut registry = ws_pull().lock().unwrap();
+    registry
+        .queues
         .insert(id, Arc::new(tokio::sync::Mutex::new(rx)));
+    registry.senders.insert(id, tx);
 }
 
 pub fn ws_pull_unregister(id: u64) {
-    ws_pull().lock().unwrap().remove(&id);
+    let mut registry = ws_pull().lock().unwrap();
+    registry.queues.remove(&id);
+    registry.senders.remove(&id);
+}
+
+pub fn ws_pull_send(id: u64, event: WsPull) -> anyhow::Result<()> {
+    let sender = ws_pull()
+        .lock()
+        .unwrap()
+        .senders
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Worker WebSocket {id} is not registered"))?;
+    sender
+        .send(event)
+        .map_err(|_| anyhow!("Worker WebSocket {id} stopped reading"))
 }
 
 pub fn ws_region_enter() {
@@ -643,7 +663,7 @@ pub(super) fn op_ws_upgrade(
         .unwrap_or_default();
     let pull = cell.is_empty().then(|| {
         let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
-        ws_pull_register(id, pull_rx);
+        ws_pull_register(id, pull_tx.clone(), pull_rx);
         ws_region_track(id);
         pull_tx
     });
@@ -703,7 +723,7 @@ pub(super) fn op_ws_next(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    let queue = ws_pull().lock().unwrap().get(&id).cloned();
+    let queue = ws_pull().lock().unwrap().queues.get(&id).cloned();
     let async_id = asyncrt::enqueue(async move {
         let Some(queue) = queue else {
             return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
@@ -742,7 +762,7 @@ pub(super) fn op_ws_connect(
     // queue here on the JS thread and track it against the running region.
     let pull = cell.is_empty().then(|| {
         let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
-        ws_pull_register(id, pull_rx);
+        ws_pull_register(id, pull_tx.clone(), pull_rx);
         ws_region_track(id);
         pull_tx
     });
@@ -803,7 +823,7 @@ pub(super) fn op_ws_bind_target(
     // accounts an outbound one.
     let cell = args.get(2).to_rust_string_lossy(scope);
     let (pull_tx, pull_rx) = tokio::sync::mpsc::unbounded_channel();
-    ws_pull_register(id, pull_rx);
+    ws_pull_register(id, pull_tx.clone(), pull_rx);
     ws_region_track(id);
     // Registered here, on the JS thread, so a frame sent between this op and
     // the pipe task buffers as a pending frame instead of being dropped for
@@ -917,6 +937,41 @@ pub(super) fn op_ws_accept_regular(
         increment_regular_ws(&cell);
     }
     tracing::info!(ws_id = id, scope = %cell, "accepted regular WebSocket");
+}
+
+pub(super) fn op_ws_accept_worker(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args
+        .get(0)
+        .to_integer(scope)
+        .map(|n| n.value() as u64)
+        .unwrap_or(0);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    ws_pull_register(id, tx, rx);
+    ws_region_track(id);
+}
+
+#[cfg(test)]
+mod worker_websocket_tests {
+    use super::*;
+
+    #[test]
+    fn host_can_send_frames_to_a_worker_socket() {
+        let id = ws_next_id();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        ws_pull_register(id, tx, rx);
+
+        ws_pull_send(id, WsPull::Text("hello".into())).unwrap();
+        let queue = ws_pull().lock().unwrap().queues.get(&id).cloned().unwrap();
+        let event = queue.try_lock().unwrap().try_recv().unwrap();
+        assert!(matches!(event, WsPull::Text(text) if text == "hello"));
+
+        ws_pull_unregister(id);
+        assert!(ws_pull_send(id, WsPull::Text("late".into())).is_err());
+    }
 }
 pub(super) fn op_ws_list(
     scope: &mut v8::PinScope,

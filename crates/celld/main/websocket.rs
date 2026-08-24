@@ -83,6 +83,12 @@ async fn finish_websocket(
     reason: String,
     was_clean: bool,
 ) {
+    if target.scope.is_empty() {
+        let _ =
+            celld::js::ws_pull_send(target.id, celld::js::WsPull::Close(code, reason, was_clean));
+        celld::js::ws_unregister(target.id);
+        return;
+    }
     let _ = dispatch_ws_closed(app, &target.scope, target.id, code, reason, was_clean).await;
     app.websocket_closed(target.scope.clone(), target.id);
     celld::js::ws_unregister(target.id);
@@ -590,11 +596,40 @@ async fn websocket_task<S>(
         let app = &app;
         let scope = target.scope.as_str();
         let id = target.id;
-        pump_cell_socket(socket, &mut outputs, false, move |data| {
-            dispatch_ws_message(app, scope, id, data)
+        pump_cell_socket(socket, &mut outputs, false, move |data| async move {
+            if scope.is_empty() {
+                let event = match data {
+                    celld::js::WsIn::Text(text) => celld::js::WsPull::Text(text),
+                    celld::js::WsIn::Binary(bytes) => celld::js::WsPull::Binary(bytes),
+                };
+                celld::js::ws_pull_send(id, event)
+            } else {
+                dispatch_ws_message(app, scope, id, data).await
+            }
         })
         .await
     };
+    if target.scope.is_empty() {
+        let _ = celld::js::ws_pull_send(
+            target.id,
+            celld::js::WsPull::Close(close.0, close.1.clone(), close.2),
+        );
+        tokio::task::yield_now().await;
+        let mut handler_sent_close = false;
+        while let Ok(output) = outputs.try_recv() {
+            handler_sent_close |= matches!(output, celld::js::WsOut::Close(_, _));
+            if !write_ws_out(&writer, output).await {
+                break;
+            }
+        }
+        if let Some(code) =
+            celld_logic::schedule::websocket_echo_close(close.0, close.2, handler_sent_close)
+        {
+            let _ = write_ws_out(&writer, celld::js::WsOut::Close(code, close.1)).await;
+        }
+        celld::js::ws_unregister(target.id);
+        return;
+    }
     if let Err(error) = dispatch_ws_closed(
         &app,
         &target.scope,
