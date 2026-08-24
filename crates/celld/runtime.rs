@@ -1319,6 +1319,25 @@ impl RuntimeManager {
             .await
     }
 
+    pub async fn stub_rpc(
+        &self,
+        cell: String,
+        id: u64,
+        path: Option<Vec<String>>,
+        args: Option<Vec<u8>>,
+    ) -> anyhow::Result<js::RpcOutcome> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::StubRpc {
+            scope: cell.clone(),
+            id,
+            path,
+            args,
+            reply,
+        };
+        self.cell_event(&cell, job, receive, "cell isolate dropped stub RPC result")
+            .await
+    }
+
     pub async fn ws_message(
         &self,
         cell: String,
@@ -2074,7 +2093,7 @@ pub(crate) async fn drive_cell(
         let name = match &job {
             CellJob::Fetch { .. } => "celld.cell_fetch",
             CellJob::Alarm { .. } => "celld.alarm",
-            CellJob::Rpc { .. } => "celld.rpc",
+            CellJob::Rpc { .. } | CellJob::StubRpc { .. } => "celld.rpc",
             CellJob::WsOpen { .. } => "celld.ws_open",
             CellJob::WsMessage { .. } => "celld.ws_message",
             CellJob::WsClosed { .. } => "celld.ws_close",
