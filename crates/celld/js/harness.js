@@ -4913,15 +4913,14 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       });
     }
   }
-  // The pump ends only when the socket closes, so it must NOT be registered
-  // as waitUntil work: that would hold the request open for as long as the
-  // socket lives, and the region can only reclaim an abandoned socket by
-  // exiting. Its `__ws_next` ops still belong to the region and are driven
-  // while the request runs, then aborted with it.
+  // An outbound socket pump is not waitUntil work. An inbound Worker socket
+  // is different: __readResponse registers its pump so the Worker stays alive
+  // until the client closes the socket.
   _startPump() {
-    if (this._pumping) return;
+    if (this._pumping) return this._pumpPromise;
     this._pumping = true;
-    this._pump().catch(() => {});
+    this._pumpPromise = this._pump().catch(() => {});
+    return this._pumpPromise;
   }
   // Drain the host queue for an isolate-polled socket. Each `__ws_next` is an
   // ordinary async op, so the request's region owns it and aborts it if the
@@ -5363,6 +5362,18 @@ globalThis.__readResponse = (r) => {
       headersJson: "[]",
       wsTargetJson: "null",
     };
+  }
+  if (r.status === 101 && r.webSocket && !r.webSocket._target) {
+    const client = r.webSocket;
+    const server = client._peer;
+    if (!server || !server._accepted) {
+      throw new TypeError("A WebSocket upgrade needs an accepted server socket");
+    }
+    const target = { id: client._id, scope: "" };
+    client._target = target;
+    server._target = target;
+    __ws_accept_worker(client._id);
+    __registerWaitUntil(server._startPump());
   }
   const bodyStreamId = r._bodyBytes === null
     ? typeof r.body?.__celldStreamId === "number" &&
